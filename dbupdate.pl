@@ -11,11 +11,16 @@ use strict;
 
 my $library = '/home/noname/MUSIC/lossless/';
 my $dbPath = '/var/lib/mpd/mpd.db';
+my $debug = 0;
+my $output;
 GetOptions ("library=s" => \$library,
-            "db=s"  => \$dbPath);
-die "не переданы пути к cue-фалам" unless @ARGV;
+            "db=s"  => \$dbPath,
+            "output=s"  => \$output,
+            "debug" => \$debug);
+die "не переданы пути к cue-фалам\n" unless @ARGV;
 
-open ( DB, "<", $dbPath ) or die "$!";
+open ( DB, "<", $dbPath ) or 
+    die "невозможно открыть файл $dbPath на чтение $!\n";
 chomp(my @db = <DB>);
 close DB;
 
@@ -33,16 +38,21 @@ foreach my $cueFile (@ARGV) {
                 $meta->{'date'}, $meta->{'genre'} || '',
                 $_->{'title'}, $_->{'track_no'} );
 
-        $newMeta{'Album'} =~ s/\s*\((?:cd|disc)\s+(\d+)\)//i;
-        $newMeta{'Disc'} = $1 if $1;
+        #$newMeta{'Album'} =~ s/\s*\((?:cd|disc)\s+(\d+)\)//i;
+        #$newMeta{'Disc'} = $1 if $1;
+        $newMeta{'Disc'} = $meta->{discnumber} if $meta->{discnumber};
 
         my @paste;
-        foreach (qw/Artist Title Album Date Track/) {
-            die "$cueFile: не полный cueFile" unless $newMeta{$_};
+        foreach (qw/Artist Title Album Date/) {
+            die "$cueFile: не полный cueFile (не все метаданные заполнены)\n"
+                unless $newMeta{$_};
             push @paste, $_.': '.$newMeta{$_};
         }
-        if ($meta->{'artist'} and
-                ($meta->{'artist'} ne $newMeta{'Artist'})) {
+        die "$cueFile: номер трека не является неотрицательным целым числом\n"
+            unless $newMeta{'Track'} =~ m/^\d+$/;
+        push @paste, 'Track'.': '. sprintf('%02d',$newMeta{'Track'});
+
+        if ($meta->{'artist'}) {
             push @paste, 'AlbumArtist: '.$meta->{'artist'};
         }
         push @paste, 'Disc: '.$newMeta{'Disc'} if $newMeta{'Disc'};
@@ -51,27 +61,33 @@ foreach my $cueFile (@ARGV) {
         my $flacFile = File::Spec->catfile($filesdir,$file);
         die "файл $flacFile не доступен\n" 
             unless -f $flacFile and -r $flacFile;
-        my $dbFile = File::Spec->abs2rel($flacFile,$library);
+        my $dbFileDir = File::Spec->abs2rel($filesdir,$library);
 
         my $flag = 0;
-        SEARCH: for (my $i=0;$i<scalar(@db);$i++) {
-            if ($db[$i] eq "file: $dbFile") {
-                $flag = 1;
-                my ($beg,$end);
-                META: for (my $j=$i;$j<scalar(@db);$j++) {
-                    $beg = $j+1 if $db[$j] =~ m/^Time:/;
-                    $end = $j-1 if $db[$j] =~ m/^mtime:/;
-                    last META if $db[$j] =~ m/^(key:|songList end)/;
+        SEARCHDIR: for (my $i=0;$i<scalar(@db);$i++) {
+            if ($db[$i] eq "begin: $dbFileDir") {
+                SEARCHFILE: for (my $k=$i;$k<scalar(@db);$k++) {
+                    last SEARCHFILE if $db[$k] eq "end: $dbFileDir";
+                    if ($db[$k] eq "song_begin: $file") {
+                        print STDERR "found $dbFileDir/$file\n" if $debug;
+                        $flag = 1;
+                        my ($beg,$end);
+                        META: for (my $j=$k;$j<scalar(@db);$j++) {
+                            $beg = $j+1 if $db[$j] =~ m/^Time:/;
+                            $end = $j-1 if $db[$j] =~ m/^mtime:/;
+                            last META if $db[$j] =~ m/^(song_end)/;
+                        }
+                        print "$beg-$end\n" if $debug;
+                        splice (@db,$beg,$end-$beg+1,@paste);
+                        last SEARCHFILE;
+                    }
                 }
-                #print "$beg-$end\n";
-                splice (@db,$beg,$end-$beg+1,@paste);
-                last SEARCH;
             }
         }
-        print STDERR "файл $dbFile не найден в базе\n" unless $flag;
+        print STDERR "файл $dbFileDir/$file не найден в базе\n" unless $flag;
     }
 }
 
-open DB, ">", $dbPath or die "запись невозможна: $!";
+open (DB, ">", $output || $dbPath) or die "запись невозможна: $!\n";
 print DB join "\n",@db;
 close DB;
