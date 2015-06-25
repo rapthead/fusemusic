@@ -6,318 +6,37 @@ use strict;
 use Data::Dumper;
 
 use Image::Magick;
-use DBI;
+#use DBI;
 use File::Find;
 use File::Spec;
 use File::Basename;
-use Digest::MD5 qw(md5_hex);
 use Audio::FLAC::Header;
 use POSIX;
-use Encode qw(encode_utf8 decode_utf8);
+#use Encode qw(encode_utf8 decode_utf8);
+use DateTime;
 
 use FindBin;
 use lib "$FindBin::RealBin/lib";
+
+use MusicDB;
 use CueParse;
 
 my $music_lib_dir = '/home/music/lossless/';
 my $covers_dir = $ENV{'HOME'}.'/covers/';
-my $db = DBI->connect(
-    "dbi:SQLite:dbname=".$ENV{'HOME'}."/play_stat.db",
-    "",
-    "",
-    { RaiseError => 1, AutoCommit => 1 }
-);
-#установка режима юникод
-#$db->{sqlite_unicode} = 1;
+my $dbpath = $ENV{'HOME'}.'/play_stat.db';
 
-my $get_track_by_uri_hash = $db->prepare(<<'__SQL_END__');
-    SELECT album.*, track.*, album.title as album_title, artist.name as artist_name
-    FROM track 
-    LEFT JOIN album ON album.album_id = track.album_id
-    LEFT JOIN artist ON artist.artist_id = album.artist_id
-    WHERE uri_hash = ?
-__SQL_END__
-
-my $find_album = $db->prepare(<<'__SQL_END__');
-    SELECT album_id FROM album
-    JOIN artist ON artist.artist_id = album.artist_id
-    WHERE artist.artist_id = ? and album.title = ?
-        and album.release_year = ? and album.orig_year = ?
-__SQL_END__
-sub find_or_add_album {
-    my $meta = shift;
-    $find_album->execute($meta->{artist_id}, $meta->{album},
-        $meta->{release_year}, $meta->{orig_year});
-    my @row = $find_album->fetchrow_array;
-    my $album_id = $row[0] if $row[0];
-    unless ($album_id) {
-        # создание альбома с указанными параметрами
-        warn sprintf("Добавляется альбом: %d-%s\n",$meta->{release_year},$meta->{album});
-        $db->do('INSERT INTO album (album_id, artist_id, title, orig_year, release_year) 
-                    VALUES ( null, ?, ?, ?, ? )',undef,
-            $meta->{artist_id},$meta->{album},$meta->{orig_year},$meta->{release_year});
-        $album_id = $db->last_insert_id(undef,undef,undef,undef);
-    }
-    return $album_id;
-}
-
-my $find_artist = $db->prepare(<<'__SQL_END__');
-    SELECT artist_id FROM artist WHERE name = ?
-__SQL_END__
-sub find_or_add_artist {
-    my $artist_name = shift;
-    $find_artist->execute($artist_name);
-    my @row = $find_artist->fetchrow_array;
-    my $artist_id;
-    $artist_id = $row[0] if $row[0];
-    unless ($artist_id) {
-        # создание исполнителя с указанным именем
-        warn "Добавляется исполнитель: $artist_name\n";
-        $db->do('INSERT INTO artist ( artist_id, name ) 
-            VALUES ( null, ? )',undef,$artist_name);
-        $artist_id = $db->last_insert_id(undef,undef,undef,undef);
-    }
-    return $artist_id;
-}
-
-my $find_track = $db->prepare(<<'__SQL_END__');
-    SELECT track.track_id, track.title, track.length FROM track
-    LEFT JOIN album ON album.album_id = track.album_id
-    LEFT JOIN artist ON artist.artist_id = album.artist_id
-    WHERE artist.name = ? and album.title = ? 
-        and album.release_year = ? and album.orig_year = ?
-        and track.track_num = ? and track.disc = ?
-__SQL_END__
-my $find_track_ids = $db->prepare(<<'__SQL_END__');
-    SELECT track.track_id FROM track
-    WHERE track.album_id = ? and track.track_num = ? and track.disc = ? and track.title = ?
-__SQL_END__
-sub find_or_add_track {
-    my $meta = shift;
-    $find_track_ids->execute($meta->{album_id}, $meta->{track_num}, $meta->{disc}, $meta->{title});
-    my @row = $find_track_ids->fetchrow_array;
-    my $track_id;
-    $track_id = $row[0] if $row[0];
-    unless ($track_id) {
-        # создание альбома с указанными параметрами
-        warn sprintf("Добавляется трек: %d-%s\n",$meta->{track_num},$meta->{title});
-        $db->do('INSERT INTO track (track_id, album_id, track_num, disc, title, track_artist, length)
-                    VALUES ( null, ?, ?, ?, ?, ?, ? )',undef,
-            $meta->{album_id}, $meta->{track_num}, $meta->{disc}, $meta->{title},
-            $meta->{track_artist} , $meta->{length});
-        $track_id = $db->last_insert_id(undef,undef,undef,undef);
-    }
-    return $track_id;
-}
-
-$db->do(<<'__SQL_END__',undef);
-CREATE TEMP TABLE found_uris
-( uri_hash VARCHAR NOT NULL );
-DELETE FROM found_uris
-__SQL_END__
-
-my @uris;
-sub update_db_track {
-    my $song_info = shift;
-    # поиск трека по uri_hash
-    $get_track_by_uri_hash->execute($song_info->{uri_hash});
-    my $row = $get_track_by_uri_hash->fetchrow_hashref;
-
-    if ($row && %$row) {
-        # если найден по uri_hash
-        #TODO: учесть длину трека
-        unless ($row->{length}) {
-            $db->do('UPDATE track SET length = ? WHERE track_id = ?',undef,
-                $song_info->{time}, $row->{track_id});
-        }
-        push(@uris,$song_info->{uri_hash});
-        die "изменилась продолжительность файла [", $song_info->{uri}, "], требуется ручное исправление ошибки\n"
-            if $row->{length} && $row->{length} != $song_info->{time};
-
-        if (!defined($row->{title}) or ($row->{title} ne $song_info->{title})
-            or !defined($row->{disc}) or ($row->{disc} != ($song_info->{disc}))
-            or (defined($row->{track_artist}) and ($song_info->{artist} eq $song_info->{albumartist}))
-            or (defined($row->{track_artist}) and ($row->{track_artist} ne $song_info->{artist}))
-            or (!defined($row->{track_artist}) and ($song_info->{artist} ne $song_info->{albumartist}))
-                ) {
-            warn "У файла [", $song_info->{uri}, "] изменены метаданные трека\n";
-            # изменение метаданных трека в базе
-            $db->do('UPDATE track SET title = ?, track_artist = ?, disc = ?, track_num = ? 
-                WHERE track_id = ?',undef,
-                $song_info->{title}, 
-                ($song_info->{artist} ne $song_info->{albumartist})?$song_info->{artist}:undef,
-                $song_info->{disc}, $song_info->{track}, $row->{track_id} );
-        }
-
-        my $album_id;
-        if (!defined($row->{album_title}) or ($row->{album_title} ne $song_info->{album}) 
-               or !defined($row->{orig_year}) or($row->{orig_year} != $song_info->{orig_year})
-               or !defined($row->{release_year})
-               or ($row->{release_year} != $song_info->{release_year})){
-            warn "У файла [", $song_info->{uri}, "] изменены метаданные альбома\n";
-	    print Dumper $row;
-	    print Dumper $song_info;
-            $album_id = find_or_add_album({ artist_id => $row->{artist_id},
-                    album => $song_info->{album}, release_year => $song_info->{release_year},
-                    orig_year => $song_info->{orig_year} });
-            # изменение идентификатора альбома у обрабатывемого трека
-            $db->do('UPDATE track SET album_id = ? WHERE track_id = ?',undef,
-                $album_id, $row->{track_id} );
-        }
-
-        if (!defined($row->{artist_name}) or ($row->{artist_name} ne $song_info->{albumartist})) {
-            warn "У файла [", $song_info->{uri}, "] изменены метаданные исполнителя\n";
-            $db->do('UPDATE album SET artist_id = ? WHERE album_id = ?',undef,
-                find_or_add_artist($song_info->{albumartist}),$album_id||$row->{album_id});
-        }
-
-    }
-    else {
-        # если не найден по uri_hash
-        warn "Трек с uri [", $song_info->{uri}, "] не найден в базе\n";
-        $find_track->execute($song_info->{albumartist},$song_info->{album},$song_info->{release_year},
-            $song_info->{orig_year}, $song_info->{track}, $song_info->{disc});
-        my $row = $find_track->fetchrow_hashref;
-        my $track_id;
-        # изменился путь к файлу и название трека
-        if ($row && %$row) {
-            die sprintf("изменилась продолжительность трека #%d с альбома %s от %s,требуется вмешательство\n",
-                $song_info->{track},$song_info->{album},$song_info->{albumartist}) 
-                if $row->{length} && ($row->{length} != $song_info->{time});
-            $track_id = $row->{track_id};
-            if ($row->{title} ne $song_info->{title}) {
-                $db->do('UPDATE track SET title = ? WHERE track_id = ?',undef,
-                    $song_info->{title}, $row->{track_id} );
-                warn "Трек с uri [", $song_info->{uri}, "] был переименован и изменено название композиции\n";
-            }
-            else {
-                warn "Трек с uri [", $song_info->{uri}, "] был переименован\n";
-            }
-        }
-        else {
-            my $artist_id = find_or_add_artist($song_info->{albumartist});
-            my $album_id = find_or_add_album({ artist_id => $artist_id, album => $song_info->{album},
-                    release_year => $song_info->{release_year}, orig_year => $song_info->{orig_year} });
-            $track_id = find_or_add_track({ album_id => $album_id, track_num => $song_info->{track},
-                    disc => $song_info->{disc}, title => $song_info->{title},
-                    track_artist =>
-                    ($song_info->{artist} ne $song_info->{albumartist})?$song_info->{artist}:undef,
-                    length => $song_info->{time} });
-        }
-
-        $db->do('UPDATE track SET uri = ?, uri_hash = ? WHERE track_id = ?',undef,
-            $song_info->{uri}, $song_info->{uri_hash}, $track_id ) if $track_id;
-    }
-
-    # добавление uri во временную таблицу
-    $db->do(<<'__SQL_END__',undef,$song_info->{uri_hash});
-    INSERT INTO found_uris (uri_hash) VALUES (?)
-__SQL_END__
-}
-
-sub clean_db {
-    #очистка uri отсутсвующих файлов
-    my $affected_rows = $db->do(<<'__SQL_END__',undef);
-    UPDATE track SET uri = null, uri_hash = null
-    WHERE uri NOTNULL and NOT EXISTS 
-        ( SELECT uri_hash
-            FROM found_uris
-            WHERE found_uris.uri_hash = track.uri_hash )
-__SQL_END__
-    warn "$affected_rows файлов удалено из библиотеки\n" if $affected_rows > 0;
-
-    # Удалить файлы альбома, треки которого ниразу не воспроизводились
-    $affected_rows = $db->do(<<'__SQL_END__',undef);
-    DELETE FROM track
-    WHERE uri ISNULL and NOT EXISTS (
-    SELECT subTrack.album_id
-            FROM play_log
-            JOIN track as subTrack ON subTrack.track_id = play_log.track_id
-            WHERE subTrack.album_id = track.album_id
-    )
-__SQL_END__
-    warn "Удалено $affected_rows треков, отсутсвующих в библиотеке и не воспроизводимых\n"
-        if $affected_rows > 0;
-
-    # Удалить альбомы не содержащие треков
-    $affected_rows = $db->do(<<'__SQL_END__',undef);
-    DELETE FROM album 
-    WHERE NOT EXISTS 
-        ( SELECT track.track_id 
-            FROM track 
-            WHERE track.album_id = album.album_id )
-__SQL_END__
-    warn "Удалено $affected_rows пустых альбомов\n" if $affected_rows > 0;
-
-    # Удалить исполнителей без альбомов
-    $affected_rows = $db->do(<<'__SQL_END__',undef);
-    DELETE FROM artist 
-    WHERE NOT EXISTS 
-        ( SELECT album.album_id
-            FROM album
-            WHERE artist.artist_id = album.artist_id )
-__SQL_END__
-    warn "Удалено $affected_rows артистов, не содержащих альбомов\n" if $affected_rows > 0;
-
-    # Изменение активности альбомов
-    $affected_rows = $db->do(<<'__SQL_END__',undef);
-    UPDATE album SET isactive = 1
-    WHERE isactive IS NULL and EXISTS
-    ( SELECT album_id
-                FROM track
-                WHERE track.album_id = album.album_id and track.uri NOT NULL
-    )
-__SQL_END__
-    warn "Сделано активными $affected_rows альбомов\n" if $affected_rows > 0;
-
-    $affected_rows = $db->do(<<'__SQL_END__',undef);
-    UPDATE album SET isactive = NULL
-    WHERE isactive NOT NULL and NOT EXISTS
-    ( SELECT album_id
-                FROM track
-                WHERE track.album_id = album.album_id and track.uri NOT NULL
-    )
-__SQL_END__
-    warn "Сделано неактивными $affected_rows альбомов\n" if $affected_rows > 0;
-}
-
-sub rsize($$) {
-    my $max = 270;
-    my ($origImage,$newImage) = @_;
-    my ($image, $x);
-    $image = Image::Magick->new;
-    $x = $image->Read($origImage);
-    my ($ox,$oy)=$image->Get('base-columns','base-rows'); 
-
-    my ($nx,$ny);
-    if ( $ox>$oy ) {
-        $nx = int(($ox/$oy)*$max);
-        $ny = $max;
-    }
-    else {
-        $nx = $max;
-        $ny = int(($oy/$ox)*$max);
-    }
-    $image->Resize(width=>$nx, height=>$ny);
-
-    my $nnx=int(($nx-$max)/2);
-    my $nny=int(($ny-$max)/2);
-    $image->Crop(geometry=>$max.'x'.$max, x=>$nnx, y=>$nny);
-
-    $x = $image->Write($newImage);
-}
+if ($dbpath) { MusicDB->change_db_path( $dbpath ); }
+MusicDB->init_objects;
 
 sub artUrgency {
     my ($dir, $albumartist, $albumtitle) = @_;
     $dir = dirname($dir) if basename($dir) =~ m/^cd\d+$/;
     my $coverPath;
     my $covername = "$albumartist-$albumtitle.jpg";
-    #my $covername =~ tr#][\/:<>?*|#_#;
     $covername =~ tr#][\/:<>?*|#_#;
 
     my @exts = ('jpg', 'jpeg', 'png', 'tiff');
     foreach my $ext (@exts) {
-        #warn $ext;
         if ( -r $dir.'/covers/front.'.$ext ) {
             $coverPath = $dir.'/covers/front.'.$ext;
         }
@@ -335,63 +54,212 @@ sub artUrgency {
     }
     rsize($coverPath,$covers_dir.$covername)
         if (! -e $covers_dir.$covername);
-    #warn $covername,"\n";
+}
+
+sub update_track($$) {
+    my ($track, $track_info) = @_;
+
+    if (!$track->length) { $track->length($track_info->{length}); }
+    elsif ($track->length != $track_info->{length}) 
+    { die "изменилась продолжительность файла [", $track_info->{uri}, "], требуется ручное исправление ошибки\n" }
+
+    my $is_track_changed = 0;
+    my @fields = ('title', 'disc', 'track_artist');
+    foreach my $field (@fields) {
+        if ($track_info->{$field} ne $track->$field) {
+            warnchanges($field, $track_info->{$field}, $track->$field);
+            $track->$field($track_info->{$field});
+            $is_track_changed = 1;
+        }
+    }
+    warn "У файла [", $track_info->{uri}, "] изменены метаданные трека\n"
+        if ($is_track_changed);
+    if ($track_info->{uri} ne $track->uri) {
+        $track->uri($track_info->{uri});
+        warn "[", $track->uri, "] -> [", $track_info->{uri}, "] был перенесен\n";
+        $is_track_changed = 1;
+    }
+    return 1 if ($is_track_changed);
+    return 0;
+}
+
+sub warnchanges($$$) {
+    warn sprintf("%s: %s -> %s\n",@_);
 }
 
 sub main {
     my @cueFiles;
-    sub wanted {
-        #utf8::upgrade($File::Find::name);
-        push(@cueFiles,$File::Find::name) if (/\.cue$/ && -r);
-    }
-    #find(\&wanted, $music_lib_dir.'cd/what.cd/Dolphin/');
+    sub wanted { push(@cueFiles,$File::Find::name) if (/\.cue$/ && -r); }
     find(\&wanted, $music_lib_dir);
+    #.'/cd/what.cd/Razika/');
+    @cueFiles = sort @cueFiles;
 
     foreach (@cueFiles) {
         my $cueFile = $_;
         my $cueDir = dirname($cueFile);
         my $cueHash = parse($cueFile);
 
-        artUrgency($cueDir, $cueHash->{'artist'}, $cueHash->{'album'});
+        #artUrgency($cueDir, $cueHash->{'artist'}, $cueHash->{'album'});
+        $cueHash->{'date'} =~ m/(\d{4})(?:-(\d{4}))?/;
+        my $cue_info = {
+            tracks => [],
+            album => {
+                genre       => $cueHash->{genre},
+                title       => $cueHash->{'album'},
+                date        => DateTime->new(year => $1),
+                release_date=> DateTime->new(year => $2 || $1),
+                is_changed  => 0,
+                db_object   => undef
+            },
+            artist => {
+                name => $cueHash->{'artist'},
+                is_changed  => 0,
+                db_object   => undef
+            }
+        };
+        warn "processing: ", $cue_info->{artist}->{name}, ' - ',$cue_info->{album}->{title},"\n";
 
         foreach my $track (@{$cueHash->{'tracks'}}) {
             my $trackFile = File::Spec->catfile($cueDir,$track->{'file'});
-            if (! -e $trackFile) {
-                warn "Файл ", $cueDir.$track->{'file'}, " не найден!\n";
-            }
+            if (! -e $trackFile) { warn "Файл [", $cueDir.$track->{'file'}, "] не найден!\n"; }
+            elsif (! -f $trackFile) { warn "[", $cueDir.$track->{'file'}, "] не является файлом!\n"; }
             else {
                 my $flacHeader = Audio::FLAC::Header->new($trackFile);
                 my $trackUri = File::Spec->abs2rel($trackFile,$music_lib_dir);
-                $cueHash->{'date'} =~ m/(\d{4})(?:-(\d{4}))?/;
-                my $track_info = {
-                    artist => $track->{'performer'} || $cueHash->{'artist'},
-                    album => $cueHash->{'album'},
-                    albumartist => $cueHash->{'artist'},
-                    title => $track->{'title'},
-                    track => $track->{'track_no'},
-                    disc => $cueHash->{discnumber} || 1,
-                    genre => $cueHash->{genre},
-                    release_year => $2 || $1,
-                    orig_year => $1,
-                    time => ceil($flacHeader->{'trackTotalLengthSeconds'}),
-                    uri => $trackUri,
-                    uri_hash => md5_hex($trackUri)
-                };
-
-                update_db_track($track_info);
+                push @{$cue_info->{tracks}}, {
+                    track_artist=> ($track->{'performer'} eq $cueHash->{'artist'}) ?
+                        '':($track->{'performer'} || $cueHash->{'artist'}),
+                    title       => $track->{'title'},
+                    track_num   => $track->{'track_no'},
+                    disc        => $cueHash->{discnumber} || 1,
+                    length      => ceil($flacHeader->{'trackTotalLengthSeconds'}),
+                    uri         => $trackUri,
+                    processed   => 0,
+                    is_changed  => 0,
+                    db_object   => undef
+                }
             }
+        }
+
+        my @album_uris = map { $_->{uri} } @{$cue_info->{'tracks'}};
+        my $db_track_search_by_uri = Track::Manager->get_tracks(
+            query => [ 'uri' => \@album_uris ],
+            require_objects => [ 'album.artist' ],
+        );
+
+        my @album_tracks = ();
+        foreach my $db_track (@$db_track_search_by_uri) {
+            my @cue_tracks = grep { $_->{uri} eq $db_track->uri } @{$cue_info->{tracks}};
+            # трек не найден
+            if (@cue_tracks!=1) { die "Что-то пошло не так, треки с одинаковым uri\n"; }
+
+            my $cur_track = $cue_tracks[0];
+            if (update_track($db_track, $cur_track)) {
+                $cur_track->{is_changed} = 1;
+            }
+            $cur_track->{db_object} = $db_track;
+            $cur_track->{processed} = 1;
+            push @album_tracks, $cur_track;
+
+            $cue_info->{album}->{db_object} = $db_track->album
+                if (!$cue_info->{album}->{db_object});
+
+            $cue_info->{artist}->{db_object} = $db_track->album->artist
+                if (!$cue_info->{artist}->{db_object});
+        }
+
+        my @not_found_by_uri = grep { !$_->{processed} } @{$cue_info->{tracks}};
+        foreach my $cur_track (@not_found_by_uri) {
+            my $db_track_search = Track::Manager->get_tracks(
+                query =>
+                [
+                    track_num       => $cur_track->{'track_num'},
+                    disc            => $cur_track->{'disc'},
+                    'album.title'   => $cue_info->{'album'}->{'title'},
+                    'album.release_date'=> $cue_info->{'album'}->{'release_date'},
+                    'album.date'   => $cue_info->{'album'}->{'date'}
+                ],
+                require_objects => [ 'album.artist' ],
+            );
+            if (@$db_track_search>1)
+            { die "Найдено больше одного соответствия [", $cur_track->{'uri'}, "]\n"; }
+            # найдено соответствие в базе
+            elsif (@$db_track_search==1) { 
+                my $db_track = $db_track_search->[0];
+                if (update_track($db_track, $cur_track)) {
+                    $cur_track->{db_object} = $db_track;
+                }
+            }
+            # не найдено соответствие в базе
+            else {
+                $cur_track->{db_object} = Track->new();
+                foreach (('track_artist', 'title', 'track_num', 'disc', 'length', 'uri')) {
+                    warnchanges($_,'',$cur_track->{$_});
+                    $cur_track->{db_object}->$_($cur_track->{$_});
+                }
+            }
+            $cur_track->{processed} = 1;
+            $cur_track->{is_changed} = 1;
+
+            if (! defined($cur_track->{db_object}->album) ) {
+                if ( $cue_info->{album}->{db_object} ) {
+                    $cur_track->{db_object}->album($cue_info->{album}->{db_object});
+                }
+                else { $cur_track->{db_object}->album(Album->new()); }
+            }
+
+            $cue_info->{album}->{db_object} = $cur_track->{db_object}->album
+                if (!$cue_info->{album}->{db_object});
+
+            if (! defined($cue_info->{album}->{db_object}->artist) ) {
+                if ( $cue_info->{artist}->{db_object} ) {
+                    $cue_info->{album}->{db_object}->artist($cue_info->{artist}->{db_object});
+                }
+                else { $cue_info->{album}->{db_object}->artist(Artist->new()); }
+            }
+
+            $cue_info->{artist}->{db_object} = $cur_track->{db_object}->album->artist
+                if (!$cue_info->{artist}->{db_object});
+        }
+
+        my $album = $cue_info->{album}->{db_object};
+        my @fields = ('title', 'date', 'release_date', 'genre');
+        foreach my $field (@fields) {
+            if ($cue_info->{album}->{$field} ne $album->$field) {
+                warnchanges("album.".$field,$album->$field?$album->$field:'',$cue_info->{album}->{$field});
+                $album->$field($cue_info->{album}->{$field});
+                $cue_info->{album}->{is_changed} = 1;
+            }
+        }
+
+        my $artist = $cue_info->{artist}->{db_object};
+        if ($artist->name ne $cue_info->{artist}->{name}) {
+            warnchanges("artist.name",$artist->name,$cue_info->{artist}->{name});
+            $artist->name($cue_info->{artist}->{name});
+            $cue_info->{artist}->{is_changed} = 1;
+            $cue_info->{album}->{is_changed} = 1;
+        }
+
+        if ($cue_info->{artist}->{is_changed}) { 
+            $artist->save( insert => 1 );
+
+            $album->artist_id($artist->artist_id());
+            $cue_info->{album}->{is_changed} = 1;
+        }
+
+        if ($cue_info->{album}->{is_changed}) {
+            $album->isactive(1);
+            $album->save();
+            $_->{db_object}->album_id($album->album_id()) foreach (@{$cue_info->{tracks}});
+        }
+
+        foreach (@{$cue_info->{tracks}}) {
+            $_->{db_object}->save if ($_->{is_changed});
         }
     }
 }
 
 main();
-clean_db();
+#clean_db();
 
-$get_track_by_uri_hash->finish();
-$find_album->finish();
-$find_artist->finish();
-$find_track->finish();
-$find_track_ids->finish();
-
-$db->disconnect;
 warn "актуализация завершена успешно\n";
