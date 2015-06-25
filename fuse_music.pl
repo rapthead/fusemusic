@@ -1,82 +1,34 @@
 #!/usr/bin/env perl
-use FindBin;
-
 use strict;
 use warnings;
+use FindBin;
 use Data::Dumper;
 use Fuse;
 use File::Basename;
 use Getopt::Long;
 use FileHandle;
 use POSIX qw(ENOENT EISDIR);
+use CHI;
              
 use lib "$FindBin::RealBin/lib";
-use CueParse;
 use Flac::TieFilehandle;
+use MusicDB;
 
-use DBI;
-
+my $dbpath='';
 my $musiclib = $ENV{'HOME'}.'/MUSIC/lossless/';
 my $mountpoint = $ENV{'HOME'}."/FUSE_MUSIC/";
-my $dbpath = $ENV{'HOME'}."/play_stat.db.bak2";
 my $debug = 0;
 GetOptions ("musiclib=s" => \$musiclib, "mountpoint=s" => \$mountpoint,
     "debug" => \$debug, "dbpath" => \$dbpath);
 
+if ($dbpath) { MusicDB->change_db_path( $dbpath ); }
+MusicDB->init_objects;
+
 printf "musiclib=%s mountpoint=%s dbpath=%s\n", $musiclib, $mountpoint, $dbpath 
     if $debug;
-#if ($debug) {
-	#print $musiclib, $mountpoint, $dbpath;
-#}
 
-my $db = DBI->connect(
-    "dbi:SQLite:dbname=$dbpath",
-    "",
-    "",
-    { RaiseError => 1, AutoCommit => 1 }
-);
-$db->func( 'fat_restrict', 1, sub { (my $str = shift) =~ tr#]["\/:<>?*|#_#; return $str; }, 'create_function' );
-
-my $get_meta = $db->prepare(<<'__SQL_END__');
-SELECT 
-    track.title, track.track_num, track.track_artist, track.disc,
-    album.title as album_title, album.orig_year, album.release_year,
-    track.track_id as track_id,
-    artist.name,
-    track.uri
-FROM track
-JOIN album ON album.album_id = track.album_id
-JOIN artist ON artist.artist_id = album.artist_id
-WHERE track.uri = ?
-__SQL_END__
-
-my $dir_list_sql = <<'__SQL_END__';
-SELECT  fat_restrict( artist.name || '-' || album.release_year || '-' || album.title) as dir,
-        album.album_id as album_id
-FROM album
-JOIN artist ON artist.artist_id = album.artist_id
-WHERE album.isactive == 1
-__SQL_END__
-my $dir_list = $db->prepare($dir_list_sql);
-my $get_album_id_by_dir = $db->prepare($dir_list_sql.' and dir = ?');
-
-my $file_list_by_dir_name_sql = <<"__SQL_END__";
-SELECT fat_restrict(substr('0' || track.track_num, length(track.track_num)) || '-' || track.title || '.flac') as file,
-        track.album_id as album_id,
-        track.uri as track_uri
-FROM ( $dir_list_sql and dir = ?) as dir_list_subquerry
-JOIN track ON dir_list_subquerry.album_id = track.album_id
-__SQL_END__
-my $file_list = $db->prepare($file_list_by_dir_name_sql);
-
-my $uri_by_album_id_sql = <<"__SQL_END__";
-SELECT fat_restrict(substr('0' || track.track_num, length(track.track_num)) || '-' || track.title || '.flac') as file,
-        track.album_id as album_id,
-        track.uri as track_uri
-FROM track
-WHERE track.album_id = ? AND file = ?
-__SQL_END__
-my $uri_by_album_id = $db->prepare($uri_by_album_id_sql);
+our $cache = CHI->new( driver => 'Memory', global => 1 );
+sub fat_restrict { (my $str = shift) =~ tr#]["\/:<>?*|#_#; return $str; }
 
 # here is where you got new metainfo
 sub getMeta {
@@ -84,53 +36,79 @@ sub getMeta {
 
     print "getMeta $uri\n" if $debug;
 
-    $get_meta->execute($uri);
-    if (my $row = $get_meta->fetchrow_hashref) {
-        my $taghash = {};
-        $taghash->{'ALBUMARTIST'} = $row->{'name'}        if $row->{'name'}        ;
-        $taghash->{'ALBUM'}       = $row->{'album_title'} if $row->{'album_title'} ;
-        $taghash->{'TITLE'}       = $row->{'title'}       if $row->{'title'}       ;
-        $taghash->{'TRACKNUMBER'} = $row->{'track_num'}   if $row->{'track_num'}   ;
-        $taghash->{'ARTIST'}      = $row->{'track_artist'}if $row->{'track_artist'};
-        $taghash->{'DISC'}        = $row->{'disc'}        if $row->{'disc'}        ;
-        $taghash->{'DATE'}        = $row->{'orig_year'}   if $row->{'orig_year'}   ;
+    my $track = Track->new('uri' => $uri);
+    $track->load(with => [ 'album.artist' ]);
+    my $album = $track->album;
+    my $artist = $album->artist;
 
-        $taghash->{'DATE'}        = $taghash->{'DATE'}.$row->{'album.release_year'} if $row->{'album.release_year'};
-        $taghash->{'ARTIST'}      = $row->{'name'} unless $taghash->{'ARTIST'};
+    my $taghash = {};
+    $taghash->{'ALBUMARTIST'} = $artist->name;
+    $taghash->{'ALBUM'}       = $album->title;
+    $taghash->{'DATE'}        = $album->date->year();
 
-        $taghash->{'MUSICBRAINZ_TRACKID'}      = 'MY_'.$row->{'track_id'};
+    $taghash->{'TITLE'}       = $track->title;
+    $taghash->{'TRACKNUMBER'} = $track->track_num;
+    $taghash->{'ARTIST'}      = $track->track_artist || $artist->name;
+    $taghash->{'DISC'}        = $track->disc;
 
-        return $taghash;
+    $taghash->{'REPLAYGAIN_REFERENCE_LOUDNESS'}= '89.0 dB';
+    $taghash->{'REPLAYGAIN_ALBUM_GAIN'}        = $album->rg_peak;
+    $taghash->{'REPLAYGAIN_ALBUM_PEAK'}        = $album->rg_gain;
+    $taghash->{'REPLAYGAIN_TRACK_GAIN'}        = $track->rg_peak;
+    $taghash->{'REPLAYGAIN_TRACK_PEAK'}        = $track->rg_gain;
+
+    $taghash->{'MUSICBRAINZ_TRACKID'}      = 'MY_'.$track->track_id;
+
+    while ( my ( $key, $val ) = each %$taghash ) {
+        delete $taghash->{$key} if not defined $val;
     }
-    else {
-        return;
-    }
+
+    $taghash->{'REPLAYGAIN_ALBUM_GAIN'} .= ' db'
+        if $taghash->{'REPLAYGAIN_TRACK_GAIN'};
+
+    $taghash->{'REPLAYGAIN_TRACK_GAIN'} .= ' db'
+        if $taghash->{'REPLAYGAIN_TRACK_GAIN'};
+
+    return $taghash;
 }
 
-{
-    my @albums_id_array;
-    sub getUri {
-        my $path = shift;
-
-        print "getUri $path\n" if $debug;
-
-        my $dirname = basename(dirname($path));
-        my $basename = basename($path);
-
-        # TODO: сделать массивом и ограничить размер
-        my $album_id;
-        my %albums_id_hash = map { $_->{'dir'} => $_->{'id'} } @albums_id_array;
-        unless ($album_id = $albums_id_hash{$dirname}) {
-            $get_album_id_by_dir->execute($dirname);
-            $album_id = $get_album_id_by_dir->fetchrow_hashref->{'album_id'};
-            $albums_id_hash{$dirname} = $album_id;
-
-            unshift(@albums_id_array, { 'dir' => $dirname, 'id' => $album_id} );
-            @albums_id_array = @albums_id_array[0..49] if scalar(@albums_id_array) > 50;
+sub rootdirlist {
+    return $cache->compute('rootdirlist', undef, sub {
+        my %albumlist;
+        my $albums = Album::Manager->get_albums_iterator(
+            require_objects => [ 'artist' ],
+            sort_by => [ 'artist.name', 'title' ]
+        );
+        while(my $album = $albums->next)
+        { 
+            my $dirname = fat_restrict(join('–', $album->artist->name, $album->date->year(), $album->title));
+            $albumlist{$dirname} = $album->album_id;
         }
-        $uri_by_album_id->execute($album_id, $basename);
-        my $row = $uri_by_album_id->fetchrow_hashref;
-        return $row->{'track_uri'};
+        return %albumlist;
+    });
+}
+
+sub tracklist {
+    my %files;
+    my $album = Album->new('album_id' => shift);
+    $album->load( with => [ 'tracks' ]);
+    foreach my $track (@{$album->tracks}) {
+        my $filename = fat_restrict(sprintf '%02d-%s.flac', $track->track_num, $track->title);
+        $files{$filename} = $track->uri if $track->uri;
+    }
+    return %files;
+}
+
+sub getUri {
+    (my $path = shift) =~ s#^/##;
+    my $dirname = basename(dirname($path));
+    my $filename = basename($path);
+    print "getUri $path\n" if $debug;
+
+    my %list = rootdirlist;
+    if (my $album_id = $list{$dirname}) {
+        my %tracklist = tracklist($album_id);
+        return $tracklist{$filename};
     }
 }
 
@@ -140,44 +118,29 @@ sub findOrig {
 }
 
 sub getdir {
-    print "getDir\n" if $debug;
-    my $dirname = shift;
+    (my $path = shift) =~ s#^/##;
+    print "getDir $path\n" if $debug;
+    my @names;
 
-    my @subdirs;
-    if ($dirname eq '/') {
-        $dir_list->execute();
-        while (my @row = $dir_list->fetchrow_array) {
-                push(@subdirs,$row[0]);
-        }
-    } 
+    my %list = rootdirlist;
+    if ($path eq '') { @names = keys %list; } 
     else {
-        $file_list->execute(basename($dirname));
-        while (my $row = $file_list->fetchrow_hashref) {
-                push(@subdirs,$row->{'file'}) if $row->{'track_uri'} && -e $musiclib.$row->{'track_uri'};
+        if (my $album_id = $list{$path}) {
+            my %tracklist = tracklist($album_id);
+            @names = keys %tracklist;
         }
     }
-
-    return (@subdirs, 0);
+    return (@names, 0);
 }
 
-{
-    my $prev_path = undef;
-    my @prev_attrs = undef;
+sub getattr {
+    (my $path = shift) =~ s#^/##;
+    print STDERR "getattr $path\n" if $debug;
 
-    sub getattr {
-        my $path = shift;
+    return $cache->compute("attributes\0$path", '5 min', sub {
         my @attrs;
-
-        if ($path eq $prev_path) {
-            print "attrs from cache\n" if $debug;
-            return @prev_attrs;
-        }
-        else {
-            $prev_path = $path;
-            print "getattr $path\n" if $debug;
-        }
-
-        unless ($path =~ m/.*\.flac$/) {
+        my %list = rootdirlist;
+        if ($list{$path} or $path eq '') {
             @attrs = (
                 2056, #dev
                 0, #ino
@@ -195,8 +158,9 @@ sub getdir {
             );
         }
         else {
+            # TODO
             my $flacfile = findOrig($path);
-            return 0 if (! -e $flacfile);
+            return 0 if (! -f $flacfile);
             my $uri = getUri($path);
             my $flh;
             { no warnings;
@@ -225,18 +189,17 @@ sub getdir {
             );
             close $flh;
         }
-
-        @prev_attrs = @attrs;
-	print Dumper \@attrs;
+	#print Dumper \@attrs;
         return @attrs;
-    }
+    });
 }
-#
+
 ## TODO: директории доступные только для чтения
 sub open {
     my $path = shift;
     my $file = findOrig($path);
     my $uri = getUri($path);
+    print STDERR "open $path\n" if $debug;
 
     return -ENOENT() unless $file;
     return -EISDIR() if -d $file;
@@ -280,6 +243,9 @@ sub release {
     close($fh);
 }
 
+$SIG{USR1} = sub { $cache->clear(); };
+
+print STDERR "init complete\n";
 Fuse::main(
     #debug       => $debug,
     mountpoint  => $mountpoint,
