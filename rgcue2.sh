@@ -1,6 +1,6 @@
 #!/bin/bash
 wd=$PWD
-tmpdir="/home/data/tmp/rgcalc/"
+tmpdir="/tmp/rgcalc/"
 [ -e $tmpdir ] || mkdir -p $tmpdir
 find "$wd" -name '*.cue' | sort | while read cue
 do
