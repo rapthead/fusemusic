@@ -91,7 +91,7 @@ sub warnchanges($$$) {
 sub main {
     my @cueFiles;
     sub wanted { push(@cueFiles,$File::Find::name) if (/\.cue$/ && -r); }
-    find(\&wanted, $music_lib_dir);#.'/cd/what.cd/311/');
+    find(\&wanted, $music_lib_dir);#.'cd/what.cd/Slightly Stoopid/2015-Meanwhile... Back at the Lab/');
     @cueFiles = sort @cueFiles;
 
     foreach (@cueFiles) {
@@ -242,7 +242,13 @@ sub main {
                 if ( $cue_info->{artist}->{db_object} ) {
                     $cue_info->{album}->{db_object}->artist($cue_info->{artist}->{db_object});
                 }
-                else { $cue_info->{album}->{db_object}->artist(Artist->new('name' => $cue_info->{artist}->{name})); }
+                else {
+                    my $artist = Artist->new('name' => $cue_info->{artist}->{name});
+                    if ( $artist->load(speculative => 1) ) {
+                        $cue_info->{album}->{db_object}->artist_id($artist->artist_id); 
+                    }
+                    $cue_info->{artist}->{db_object} = $artist;
+                }
             }
 
             $cue_info->{artist}->{db_object} = $cur_track->{db_object}->album->artist
@@ -260,7 +266,7 @@ sub main {
         }
 
         my $artist = $cue_info->{artist}->{db_object};
-        if ($artist->name ne $cue_info->{artist}->{name}) {
+        if ($artist->name ne $cue_info->{artist}->{name} || !$artist->artist_id) {
             warnchanges("artist.name",$artist->name,$cue_info->{artist}->{name});
             $artist->name($cue_info->{artist}->{name});
             $artist->artist_id(undef);
